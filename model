@@ -1,0 +1,336 @@
+#!/usr/bin/env python36
+# -*- coding: utf-8 -*-
+
+
+import datetime
+import math
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import Module, Parameter
+import torch.nn.functional as F
+from tqdm import tqdm
+from aggregator import  GlobalAggregator
+
+def layer_norm(x):
+    ave_x = torch.mean(x, -1).unsqueeze(-1)
+    x = x - ave_x
+    norm_x = torch.sqrt(torch.sum(x**2, -1)).unsqueeze(-1)
+    y = x / norm_x
+
+    return y
+
+class GNN(Module):
+    def __init__(self, hidden_size, step=1):
+        super(GNN, self).__init__()
+        self.step = step
+        self.hidden_size = hidden_size
+        self.input_size = hidden_size * 2
+        self.gate_size = 3 * hidden_size
+        self.w_ih = Parameter(torch.Tensor(self.gate_size, self.input_size))
+        self.w_hh = Parameter(torch.Tensor(self.gate_size, self.hidden_size))
+        self.b_ih = Parameter(torch.Tensor(self.gate_size))
+        self.b_hh = Parameter(torch.Tensor(self.gate_size))
+        self.b_iah = Parameter(torch.Tensor(self.hidden_size))
+        self.b_oah = Parameter(torch.Tensor(self.hidden_size))
+
+        self.linear_edge_in = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+
+
+    def GNNCell(self, A, hidden):
+        input_in = torch.matmul(A[:, :, :A.shape[1]], self.linear_edge_in(hidden)) + self.b_iah#入度
+        input_out = torch.matmul(A[:, :, A.shape[1]: 2 * A.shape[1]], self.linear_edge_out(hidden)) + self.b_oah#出度
+        inputs = torch.cat([input_in, input_out], 2)#入度出度拼接
+        gi = F.linear(inputs, self.w_ih, self.b_ih)#ai
+        gh = F.linear(hidden, self.w_hh, self.b_hh)#hi
+        i_r, i_i, i_n = gi.chunk(3, 2)
+        h_r, h_i, h_n = gh.chunk(3, 2)
+        resetgate = torch.sigmoid(i_r + h_r)
+        inputgate = torch.sigmoid(i_i + h_i)
+        newgate = torch.tanh(i_n + resetgate * h_n)
+        hy = newgate + inputgate * (hidden - newgate)#
+        return hy
+
+    def ave_pooling(self, hidden, graph_mask):
+        length = torch.sum(graph_mask, 1)
+
+        hidden = hidden * graph_mask.unsqueeze(-1).float()
+        output = torch.sum(hidden, 1) / length.unsqueeze(-1).float()
+        return output
+#xs0
+    def att_out(self, hidden, star_node, graph_mask):
+        sim = torch.matmul(hidden, star_node.unsqueeze(-1)).squeeze()
+        sim = torch.exp(sim)
+        sim = sim * graph_mask.float()
+        sim /= torch.sum(sim, -1).unsqueeze(-1) + 1e-24
+        att_hidden = sim.unsqueeze(-1) * hidden
+        output = torch.sum(att_hidden, 1)
+
+        return output
+    def forward(self, A, hidden,graph_mask):
+        star_node = self.ave_pooling(hidden, graph_mask)
+
+        for i in range(self.step):
+            hidden = self.GNNCell(A, hidden)
+            sim = torch.matmul(hidden, star_node.unsqueeze(-1)).squeeze(-1) / math.sqrt(self.hidden_size)
+            alpha = torch.sigmoid(sim).unsqueeze(-1)
+            bs, item_num = hidden.shape[0], hidden.shape[1]
+            star_node_repeat = star_node.repeat(1, item_num).view(bs, item_num, self.hidden_size)
+            hidden = (1 - alpha) * hidden + alpha * star_node_repeat
+            star_node = self.att_out(hidden, star_node, graph_mask)
+
+
+        return hidden, star_node
+##星节点信息和hidden
+
+class SessionGraph(Module):
+    def __init__(self, opt, n_node,adj_all,num):
+        super(SessionGraph, self).__init__()
+        self.hidden_size = opt.hiddenSize
+        self.hop = opt.n_iter
+        self.n_node = n_node
+        self.sample_num = opt.n_sample
+        self.batch_size = opt.batchSize
+        self.scale = opt.scale
+        self.nonhybrid = opt.nonhybrid
+        self.adj_all = trans_to_cuda(torch.Tensor(adj_all)).long()
+        self.num = trans_to_cuda(torch.Tensor(num)).float()
+        self.embedding = nn.Embedding(self.n_node, self.hidden_size)
+        self.gnn = GNN(self.hidden_size, step=opt.step)
+        self.linear_one = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
+        self.linear_four = nn.Linear(self.hidden_size, 1, bias=False)
+
+        self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
+        self.loss_function = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
+
+        self.dropout_local = opt.dropout_local
+        self.dropout_global = opt.dropout_global
+        # Item representation & Position representation
+        self.pos_embedding = nn.Embedding(200, self.hidden_size)
+        self.w_1 = nn.Parameter(torch.Tensor(2 * self.hidden_size, self.hidden_size))
+        self.w_2 = nn.Parameter(torch.Tensor(self.hidden_size, 1))
+        self.glu1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.glu2 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        # Aggregator
+
+        self.global_agg = []
+        for i in range(self.hop):
+            if opt.activate == 'relu':
+                agg = GlobalAggregator(self.hidden_size, opt.dropout_gcn, act=torch.relu)
+            else:
+                agg = GlobalAggregator(self.hidden_size, opt.dropout_gcn, act=torch.tanh)
+            self.add_module('agg_gcn_{}'.format(i), agg)
+            self.global_agg.append(agg)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+    def sample(self, target, n_sample):
+        # neighbor = self.adj_all[target.view(-1)]
+        # index = np.arange(neighbor.shape[1])
+        # np.random.shuffle(index)
+        # index = index[:n_sample]
+        # return self.adj_all[target.view(-1)][:, index], self.num[target.view(-1)][:, index]
+        return self.adj_all[target.view(-1)], self.num[target.view(-1)]
+    def compute_scores_h_global(self, hidden, mask):
+
+       # 加入反向位置编码
+        mask = mask.float().unsqueeze(-1)
+
+        batch_size = hidden.shape[0]
+        len = hidden.shape[1]
+        pos_emb = self.pos_embedding.weight[:len]
+        pos_emb = pos_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+
+        hs = torch.sum(hidden * mask, -2) / torch.sum(mask, 1)
+        hs = hs.unsqueeze(-2).repeat(1, len, 1)
+        nh = torch.matmul(torch.cat([pos_emb, hidden], -1), self.w_1)
+        nh = torch.tanh(nh)
+        nh = torch.sigmoid(self.glu1(nh) + self.glu2(hs))
+        beta = torch.matmul(nh, self.w_2)
+        beta = beta * mask
+
+        select = torch.sum(beta * hidden, 1)
+
+
+
+        # b = self.embedding.weight[1:]  # n_nodes x latent_size
+        # scores = torch.matmul(select, b.transpose(1, 0))
+        # return scores
+
+        return select
+
+    def compute_scores_hidden(self, seq_hidden, star_node, mask):
+        bs, item_num = seq_hidden.shape[0], seq_hidden.shape[1]
+        index = torch.arange(item_num).unsqueeze(0)
+        pos_index = index.repeat(bs, 1).view(bs, item_num)
+        pos_index = trans_to_cuda(torch.Tensor(pos_index.float()).long())
+        pos_hidden = self.pos_embedding(pos_index)
+        seq_hidden = seq_hidden + pos_hidden
+#使用软注意力机制，公式20
+        ht = seq_hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]
+        q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])
+        q2 = self.linear_two(star_node).view(star_node.shape[0], 1, star_node.shape[1])#星节点线性化
+        q3 = self.linear_three(seq_hidden)
+        alpha = self.linear_four(torch.sigmoid(q1 + q2 + q3))
+        #公式21
+        a = torch.sum(alpha * seq_hidden * mask.view(mask.shape[0], -1, 1).float(), 1)
+#加计算交叉熵
+        a = self.linear_transform(torch.cat([a, ht], 1))
+        b = self.embedding.weight[1:]
+
+        a = layer_norm(a)
+        b = layer_norm(b)
+        scores = torch.matmul(a, b.transpose(1, 0))
+        scores *= self.scale
+
+        return scores
+
+    # def sample(self, target, n_sample):
+    #     return self.adj_all[target.view(-1)], self.num[target.view(-1)]
+
+    def forward(self, inputs, A,mask_item,item,graph_mask):
+
+        hidden = self.embedding(inputs)
+        hidden, star_node = self.gnn(A, hidden,graph_mask)#所以输入A hidden graph_mask
+
+
+
+        batch_size = inputs.shape[0]
+        seqs_len = inputs.shape[1]
+        h = self.embedding(inputs)
+
+        # global
+        item_neighbors = [inputs]
+        weight_neighbors = []
+        support_size = seqs_len
+
+        for i in range(1, self.hop + 1):
+            item_sample_i, weight_sample_i = self.sample(item_neighbors[-1], self.sample_num)
+            support_size *= self.sample_num
+            item_neighbors.append(item_sample_i.view(batch_size, support_size))
+            weight_neighbors.append(weight_sample_i.view(batch_size, support_size))
+
+        entity_vectors = [self.embedding(i) for i in item_neighbors]
+        weight_vectors = weight_neighbors
+
+        session_info = []
+        item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
+        # mean
+        sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
+
+        # sum
+        # sum_item_emb = torch.sum(item_emb, 1)
+
+        sum_item_emb = sum_item_emb.unsqueeze(-2)
+        for i in range(self.hop):
+            session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
+
+        for n_hop in range(self.hop):
+            entity_vectors_next_iter = []
+            shape = [batch_size, -1, self.sample_num, self.hidden_size]
+            for hop in range(self.hop - n_hop):
+                aggregator = self.global_agg[n_hop]
+                vector = aggregator(self_vectors=entity_vectors[hop],
+                                    neighbor_vector=entity_vectors[hop + 1].view(shape),
+                                    masks=None,
+                                    batch_size=batch_size,
+                                    neighbor_weight=weight_vectors[hop].view(batch_size, -1, self.sample_num),
+                                    extra_vector=session_info[hop])
+                entity_vectors_next_iter.append(vector)
+            entity_vectors = entity_vectors_next_iter
+
+        h_global = entity_vectors[0].view(batch_size, seqs_len, self.hidden_size)
+
+        hidden = F.dropout(hidden, self.dropout_local, training=self.training)
+        h_global = F.dropout(h_global, self.dropout_global, training=self.training)
+
+        return hidden,h_global, star_node
+
+
+def trans_to_cuda(variable):
+    if torch.cuda.is_available():
+        return variable.cuda()
+    else:
+        return variable
+
+
+def trans_to_cpu(variable):
+    if torch.cuda.is_available():
+        return variable.cpu()
+    else:
+        return variable
+
+
+def forward(model, i, data):
+    alias_inputs, A, items, mask, targets,inputs = data.get_slice(i)
+    alias_inputs = trans_to_cuda(torch.Tensor(alias_inputs).long())
+    items = trans_to_cuda(torch.Tensor(items).long())
+    graph_mask = torch.sign(items)
+    A = trans_to_cuda(torch.Tensor(A).float())
+    mask = trans_to_cuda(torch.Tensor(mask).long())
+    inputs = trans_to_cuda(torch.Tensor(inputs).long())
+
+    hidden,h_global,star_node = model(items, A,mask,inputs,graph_mask)
+
+    get1 = lambda i: hidden[i][alias_inputs[i]]
+    seq_hidden = torch.stack([get1(i) for i in torch.arange(len(alias_inputs)).long()])
+    get2 = lambda i: h_global[i][alias_inputs[i]]
+    global_hidden = torch.stack([get2(i) for i in torch.arange(len(alias_inputs)).long()])
+    seq_hidden_global = seq_hidden + global_hidden
+    # a = model.compute_scores_h_global(global_hidden, mask)
+    scores = model.compute_scores_hidden(seq_hidden_global, star_node,mask)
+    # select = (a + b) / 2.0
+    # select = a + b
+
+    # b = model.embedding.weight[1:]  # n_nodes x latent_size
+    # b = layer_norm(b)
+    #
+    # scores = torch.matmul(select, b.transpose(1, 0))
+    return targets,scores
+
+
+def train_test(model, train_data, test_data):
+    model.scheduler.step()
+    print('start training: ', datetime.datetime.now())
+    model.train()
+    total_loss = 0.0
+    slices = train_data.generate_batch(model.batch_size)
+    for i, j in tqdm(zip(slices, np.arange(len(slices)))):
+        model.optimizer.zero_grad()
+        targets, scores = forward(model, i, train_data)
+        targets = trans_to_cuda(torch.Tensor(targets).long())
+        loss = model.loss_function(scores, targets - 1)
+        loss.backward()
+        model.optimizer.step()
+        total_loss += loss
+        if j % int(len(slices) / 5 + 1) == 0:
+            print('[%d/%d] Loss: %.4f' % (j, len(slices), loss.item()))
+    print('\tLoss:\t%.3f' % total_loss)
+
+    print('start predicting: ', datetime.datetime.now())
+    model.eval()
+    hit, mrr = [], []
+    slices = test_data.generate_batch(model.batch_size)
+    for i in slices:
+        targets, scores = forward(model, i, test_data)
+        sub_scores = scores.topk(20)[1]
+        sub_scores = trans_to_cpu(sub_scores).detach().numpy()
+        for score, target, mask in zip(sub_scores, targets, test_data.mask):
+            hit.append(np.isin(target - 1, score))
+            if len(np.where(score == target - 1)[0]) == 0:
+                mrr.append(0)
+            else:
+                mrr.append(1 / (np.where(score == target - 1)[0][0] + 1))
+    hit = np.mean(hit) * 100
+    mrr = np.mean(mrr) * 100
+    return hit, mrr
